@@ -1,6 +1,6 @@
 """
 Telegram-бот — личный Platrum-ассистент для руководителей.
-Голос/текст/видеокружки → умная обработка: задачи, поиск, комментарии, статусы, структура компании.
+Архитектура: Claude с tool use + история разговора на пользователя.
 """
 
 import os
@@ -27,6 +27,7 @@ ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
 PLATRUM_HOST  = 'a96a08a.platrum.ru'
 DATA_DIR      = Path(os.environ.get('DATA_DIR', '/app/data'))
 DATA_FILE     = DATA_DIR / 'users.json'
+MAX_HISTORY   = 20   # messages per user to keep
 
 WAITING_KEY = 1
 
@@ -44,9 +45,8 @@ def get_whisper():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        log.info("Loading Whisper model 'base'...")
+        log.info("Loading Whisper model...")
         _whisper_model = WhisperModel('base', device='cpu', compute_type='int8')
-        log.info("Whisper model loaded.")
     return _whisper_model
 
 # ─────────────── USER STORAGE ───────────────
@@ -70,6 +70,17 @@ def set_user(user_id: int, data: dict):
     users = load_users()
     users[str(user_id)] = data
     save_users(users)
+
+def get_history(user_id: int) -> list:
+    user = get_user(user_id)
+    return user.get('history', []) if user else []
+
+def save_history(user_id: int, history: list):
+    users = load_users()
+    uid = str(user_id)
+    if uid in users:
+        users[uid]['history'] = history[-MAX_HISTORY:]
+        save_users(users)
 
 # ─────────────── PLATRUM API ───────────────
 def _platrum_post(path: str, body: dict, api_key: str) -> dict:
@@ -102,72 +113,91 @@ def _platrum_post(path: str, body: dict, api_key: str) -> dict:
     return json.loads(b''.join(chunks).decode() if chunks else raw.decode())
 
 def verify_platrum_key(api_key: str) -> dict:
-    data = _platrum_post(
-        '/tasks/api/task/create',
-        {'name': '🤖 Тест подключения бота (можно удалить)'},
-        api_key
-    )
+    data = _platrum_post('/tasks/api/task/create',
+                         {'name': '🤖 Тест подключения бота (можно удалить)'}, api_key)
     if data.get('status') != 'success':
         raise ValueError(data.get('error_message') or data.get('error') or 'Неверный API-ключ')
     task = data['data']
     return {'owner_user_id': task['owner_user_id'], 'test_task_id': task['id']}
 
-def create_platrum_task(task: dict, api_key: str) -> dict:
-    body = {'name': task['name']}
-    if task.get('description'):
-        body['description'] = task['description']
-    if task.get('finish_date'):
-        body['finish_date'] = task['finish_date']
-    if task.get('is_important'):
+def _create_task(inp: dict, api_key: str) -> str:
+    body = {'name': inp['name']}
+    if inp.get('description'):
+        body['description'] = inp['description']
+    if inp.get('finish_date'):
+        body['finish_date'] = inp['finish_date']
+    if inp.get('is_important'):
         body['is_important'] = True
     data = _platrum_post('/tasks/api/task/create', body, api_key)
     if data.get('status') != 'success':
-        raise RuntimeError(data.get('error_message') or data.get('error') or 'Ошибка создания задачи')
-    return data['data']
+        return f"Ошибка: {data.get('error_message') or data.get('error')}"
+    task = data['data']
+    url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
+    return f"Задача создана: #{task['id']}\nНазвание: {task['name']}\nСсылка: {url}"
 
-def search_platrum_tasks(query: str, api_key: str) -> list:
-    data = _platrum_post('/tasks/api/task/list', {'search': query}, api_key)
+def _find_task(inp: dict, api_key: str) -> str:
+    task_id = inp.get('task_id')
+    if task_id:
+        data = _platrum_post('/tasks/api/task/get', {'id': int(task_id)}, api_key)
+        if data.get('status') == 'success':
+            t = data['data']
+            url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
+            status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+            return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
+    query = inp.get('query', '').strip()
+    if query:
+        data = _platrum_post('/tasks/api/task/list', {'search': query}, api_key)
+        if data.get('status') == 'success':
+            tasks = data.get('data', [])
+            if isinstance(tasks, dict):
+                tasks = tasks.get('items', tasks.get('tasks', []))
+            if tasks:
+                t = tasks[0]
+                url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
+                status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+                return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
+            return "Задача не найдена по запросу: " + query
+    return "Не удалось найти задачу — укажи название или ID."
+
+def _add_comment(inp: dict, api_key: str) -> str:
+    task = _resolve_task_from_input(inp, api_key)
+    if not task:
+        return "Задача не найдена. Укажи название или ID."
+    comment = inp.get('comment', '').strip()
+    if not comment:
+        return "Не указан текст комментария."
+    data = _platrum_post('/tasks/api/tasks/comment/save', {'task_id': task['id'], 'text': comment}, api_key)
     if data.get('status') != 'success':
-        return []
-    result = data.get('data', [])
-    if isinstance(result, list):
-        return result
-    if isinstance(result, dict):
-        return result.get('items', result.get('tasks', []))
-    return []
+        return f"Ошибка добавления комментария: {data.get('error_message')}"
+    url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
+    return f"Комментарий добавлен в задачу \"{task['name']}\"\nСсылка: {url}"
 
-def get_platrum_task(task_id: int, api_key: str) -> dict | None:
-    data = _platrum_post('/tasks/api/task/get', {'id': task_id}, api_key)
+def _change_status(inp: dict, api_key: str) -> str:
+    task = _resolve_task_from_input(inp, api_key)
+    if not task:
+        return "Задача не найдена. Укажи название или ID."
+    new_status = inp.get('status', '').strip()
+    if not new_status:
+        return "Не указан новый статус."
+    data = _platrum_post('/tasks/api/task/update', {'id': task['id'], 'status_key': new_status}, api_key)
     if data.get('status') != 'success':
-        return None
-    return data.get('data')
+        return f"Ошибка изменения статуса: {data.get('error_message')}"
+    status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+    url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
+    return f"Статус задачи \"{task['name']}\" изменён на: {status_map.get(new_status, new_status)}\nСсылка: {url}"
 
-def add_platrum_comment(task_id: int, text: str, api_key: str) -> dict:
-    data = _platrum_post('/tasks/api/tasks/comment/save', {'task_id': task_id, 'text': text}, api_key)
-    if data.get('status') != 'success':
-        raise RuntimeError(data.get('error_message') or 'Ошибка добавления комментария')
-    return data['data']
+def _get_company_structure(api_key: str) -> str:
+    blocks_r = _platrum_post('/orgschema/api/block/list', {}, api_key)
+    workers_r = _platrum_post('/orgschema/api/worker/list-active', {}, api_key)
+    profiles_r = _platrum_post('/user/api/profile/list', {}, api_key)
 
-def update_platrum_task_status(task_id: int, status_key: str, api_key: str) -> dict:
-    data = _platrum_post('/tasks/api/task/update', {'id': task_id, 'status_key': status_key}, api_key)
-    if data.get('status') != 'success':
-        raise RuntimeError(data.get('error_message') or 'Ошибка изменения статуса')
-    return data.get('data', {})
+    if blocks_r.get('status') != 'success':
+        return "Не удалось загрузить структуру компании."
 
-def get_company_structure(api_key: str) -> str:
-    """Load org chart: blocks + active workers + profiles → formatted text."""
-    blocks_resp = _platrum_post('/orgschema/api/block/list', {}, api_key)
-    workers_resp = _platrum_post('/orgschema/api/worker/list-active', {}, api_key)
-    profiles_resp = _platrum_post('/user/api/profile/list', {}, api_key)
+    blocks = blocks_r.get('data', [])
+    workers = workers_r.get('data', []) if workers_r.get('status') == 'success' else []
+    profiles = profiles_r.get('data', {}) if profiles_r.get('status') == 'success' else {}
 
-    if blocks_resp.get('status') != 'success':
-        raise RuntimeError('Не удалось загрузить структуру компании')
-
-    blocks = blocks_resp.get('data', [])
-    workers = workers_resp.get('data', []) if workers_resp.get('status') == 'success' else []
-    profiles = profiles_resp.get('data', {}) if profiles_resp.get('status') == 'success' else {}
-
-    # block_id → [names]
     block_people: dict[str, list] = {}
     for w in workers:
         bid = str(w.get('block_id', ''))
@@ -179,14 +209,14 @@ def get_company_structure(api_key: str) -> str:
     block_map = {str(b['id']): b for b in blocks}
     root_blocks = [b for b in blocks if not b.get('parent_id') or str(b.get('parent_id')) not in block_map]
 
-    lines: list[str] = ['🏢 *Структура компании:*\n']
+    lines: list[str] = ['Структура компании:\n']
 
     def render(block, depth=0):
-        prefix = '  ' * depth + ('• ' if depth > 0 else '')
+        prefix = '  ' * depth + '• '
         title = block.get('position') or block.get('name', '?')
         people = block_people.get(str(block['id']), [])
         person_str = ': ' + ', '.join(people) if people else ''
-        lines.append(f'{prefix}*{title}*{person_str}')
+        lines.append(f'{prefix}{title}{person_str}')
         children = sorted(
             [b for b in blocks if str(b.get('parent_id')) == str(block['id'])],
             key=lambda b: b.get('order', 0)
@@ -198,6 +228,151 @@ def get_company_structure(api_key: str) -> str:
         render(block)
 
     return '\n'.join(lines)
+
+def _resolve_task_from_input(inp: dict, api_key: str) -> dict | None:
+    task_id = inp.get('task_id')
+    if task_id:
+        data = _platrum_post('/tasks/api/task/get', {'id': int(task_id)}, api_key)
+        if data.get('status') == 'success':
+            return data.get('data')
+    query = (inp.get('task_query') or inp.get('query') or '').strip()
+    if query:
+        data = _platrum_post('/tasks/api/task/list', {'search': query}, api_key)
+        if data.get('status') == 'success':
+            tasks = data.get('data', [])
+            if isinstance(tasks, dict):
+                tasks = tasks.get('items', tasks.get('tasks', []))
+            if tasks:
+                return tasks[0]
+    return None
+
+# ─────────────── CLAUDE TOOLS DEFINITION ───────────────
+TOOLS = [
+    {
+        "name": "create_task",
+        "description": "Создать задачу в Platrum CRM от имени пользователя. Вызывай ТОЛЬКО когда пользователь явно хочет поставить задачу.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Краткое название задачи (до 100 символов)"},
+                "description": {"type": "string", "description": "Описание, детали, контекст задачи"},
+                "finish_date": {"type": "string", "description": "Дедлайн в формате YYYY-MM-DD"},
+                "is_important": {"type": "boolean", "description": "True если задача срочная или важная"}
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "find_task",
+        "description": "Найти задачу в Platrum по названию или ID. Возвращает название, статус и ссылку.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Название или ключевые слова для поиска"},
+                "task_id": {"type": "integer", "description": "Точный ID задачи если известен"}
+            }
+        }
+    },
+    {
+        "name": "add_comment",
+        "description": "Добавить комментарий к существующей задаче в Platrum.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_query": {"type": "string", "description": "Название задачи для поиска"},
+                "task_id": {"type": "integer", "description": "ID задачи если известен"},
+                "comment": {"type": "string", "description": "Текст комментария"}
+            },
+            "required": ["comment"]
+        }
+    },
+    {
+        "name": "change_task_status",
+        "description": "Изменить статус задачи в Platrum.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_query": {"type": "string", "description": "Название задачи"},
+                "task_id": {"type": "integer", "description": "ID задачи"},
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "in_progress", "done", "cancelled"],
+                    "description": "Новый статус: open=открыта, in_progress=в работе, done=выполнена, cancelled=отменена"
+                }
+            },
+            "required": ["status"]
+        }
+    },
+    {
+        "name": "get_company_structure",
+        "description": "Показать организационную структуру компании: должности и сотрудники.",
+        "input_schema": {"type": "object", "properties": {}}
+    }
+]
+
+def execute_tool(name: str, inp: dict, api_key: str) -> str:
+    try:
+        if name == 'create_task':
+            return _create_task(inp, api_key)
+        elif name == 'find_task':
+            return _find_task(inp, api_key)
+        elif name == 'add_comment':
+            return _add_comment(inp, api_key)
+        elif name == 'change_task_status':
+            return _change_status(inp, api_key)
+        elif name == 'get_company_structure':
+            return _get_company_structure(api_key)
+        else:
+            return f"Неизвестный инструмент: {name}"
+    except Exception as e:
+        return f"Ошибка при выполнении {name}: {e}"
+
+# ─────────────── AGENTIC LOOP ───────────────
+def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, list]:
+    today = datetime.now().strftime('%Y-%m-%d')
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    system = (
+        f"Ты — личный Platrum-ассистент руководителя {user['name']} в компании по продаже б/у автозапчастей.\n"
+        f"Сегодня: {today}.\n\n"
+        "Отвечай по-русски, кратко и по делу — как опытный бизнес-ассистент.\n"
+        "Используй инструменты ТОЛЬКО когда пользователь явно просит создать/найти/изменить задачу или узнать структуру.\n"
+        "Если это просто вопрос или разговор — отвечай напрямую без инструментов.\n"
+        "При создании задачи улучшай формулировку: делай название конкретным и action-oriented.\n"
+        "После выполнения инструмента дай краткий содержательный ответ, не пересказывай технические детали."
+    )
+
+    messages = list(history) + [{"role": "user", "content": user_text}]
+
+    for _ in range(5):  # max 5 tool call rounds
+        response = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=1000,
+            system=system,
+            tools=TOOLS,
+            messages=messages
+        )
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == 'end_turn':
+            text = ' '.join(b.text for b in response.content if hasattr(b, 'text') and b.text)
+            return text.strip() or '✓', messages
+
+        if response.stop_reason == 'tool_use':
+            tool_results = []
+            for block in response.content:
+                if block.type == 'tool_use':
+                    log.info(f"Tool call: {block.name}({block.input})")
+                    result = execute_tool(block.name, block.input, user['api_key'])
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+    return "Не смог обработать запрос. Попробуй ещё раз.", messages
 
 # ─────────────── TRANSCRIPTION ───────────────
 def transcribe_audio(file_path: str) -> str:
@@ -213,50 +388,7 @@ def transcribe_audio(file_path: str) -> str:
     mp3_path.unlink(missing_ok=True)
     return text
 
-# ─────────────── INTENT CLASSIFICATION ───────────────
-def classify_intent(text: str, user_name: str) -> dict:
-    today = datetime.now().strftime('%Y-%m-%d')
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    msg = client.messages.create(
-        model='claude-haiku-4-5-20251001',
-        max_tokens=700,
-        messages=[{'role': 'user', 'content': (
-            f'Ты — помощник руководителя в компании по продаже б/у автозапчастей.\n'
-            f'Пользователь: {user_name}. Сегодня: {today}.\n\n'
-            f'Определи что хочет пользователь и верни JSON:\n'
-            f'{{\n'
-            f'  "intent": "create_task" | "find_task" | "add_comment" | "change_status" | "company_info" | "chat",\n'
-            f'  "task_query": "название или ключевые слова задачи (для find_task, add_comment, change_status)",\n'
-            f'  "task_id": число или null (если назвал конкретный номер задачи),\n'
-            f'  "comment_text": "текст комментария (только для add_comment)",\n'
-            f'  "new_status": "open" | "in_progress" | "done" | "cancelled" (только для change_status),\n'
-            f'  "company_query": "что именно хочет узнать о структуре (для company_info)",\n'
-            f'  "chat_response": "краткий ответ (только для chat)",\n'
-            f'  "task": {{"name": "до 100 символов", "description": "подробности или null", "finish_date": "YYYY-MM-DD или null", "is_important": true/false}}\n'
-            f'}}\n\n'
-            f'Правила:\n'
-            f'- create_task: нужно СДЕЛАТЬ что-то ("позвонить X", "проверить Y", "написать Z")\n'
-            f'- find_task: НАЙТИ задачу / получить ссылку / узнать статус ("пришли ссылку", "найди задачу", "какой статус")\n'
-            f'- add_comment: добавить КОММЕНТАРИЙ к задаче ("напиши в задачу", "добавь комментарий")\n'
-            f'- change_status: изменить СТАТУС задачи ("отметь как выполненную", "переведи в работу", "закрой задачу", "отмени")\n'
-            f'- company_info: структура компании, кто занимает какую должность ("кто руководитель", "покажи структуру", "кто менеджер по продажам")\n'
-            f'- chat: вопрос, разговор, всё остальное\n\n'
-            f'Текст: {text}\n\nВерни только JSON.'
-        )}]
-    )
-    raw = msg.content[0].text.strip()
-    m = re.search(r'\{.*\}', raw, re.DOTALL)
-    return json.loads(m.group() if m else raw)
-
-STATUS_LABELS = {
-    'open': 'Открыта',
-    'in_progress': 'В работе',
-    'done': 'Выполнена',
-    'cancelled': 'Отменена',
-    'closed': 'Закрыта',
-}
-
-# ─────────────── HANDLERS ───────────────
+# ─────────────── TELEGRAM HANDLERS ───────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     user = get_user(user_id)
@@ -264,14 +396,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if user:
         await update.message.reply_text(
             f"Привет, {user['name']}! 👋\n\n"
-            "Что умею:\n"
-            "• 📋 Поставить задачу в Platrum\n"
-            "• 🔍 Найти задачу и прислать ссылку\n"
-            "• 💬 Добавить комментарий к задаче\n"
-            "• ✅ Изменить статус задачи\n"
-            "• 🏢 Показать структуру компании\n\n"
-            "Говори голосом, видеокружком или пиши текст.\n\n"
-            "/reset — сменить API-ключ  /help — справка"
+            "Говори голосом, видеокружком или пиши — помогу с Platrum.\n"
+            "Понимаю контекст разговора, создаю задачи, ищу, комментирую, меняю статусы.\n\n"
+            "/reset — сменить API-ключ  /clear — очистить историю  /help — справка"
         )
         return ConversationHandler.END
 
@@ -280,9 +407,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         "Для начала нужен твой Platrum API-ключ.\n\n"
         "Как получить:\n"
         "1. Открой Platrum → Настройки (шестерёнка) → Интеграции и API → API ключи\n"
-        "2. Нажми *«+ Добавить»*, назови «Бот» и сохрани\n"
+        "2. Нажми «+ Добавить», назови «Бот» и сохрани\n"
         "3. Скопируй ключ и вставь его сюда",
-        parse_mode='Markdown'
     )
     return WAITING_KEY
 
@@ -290,13 +416,22 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Введи новый Platrum API-ключ:")
     return WAITING_KEY
 
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    users = load_users()
+    uid = str(user_id)
+    if uid in users:
+        users[uid]['history'] = []
+        save_users(users)
+    await update.message.reply_text("История разговора очищена.")
+
 async def receive_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     key = update.message.text.strip()
     user_id = update.effective_user.id
     tg_name = update.effective_user.full_name
 
     if len(key) < 20 or ' ' in key:
-        await update.message.reply_text("Это не похоже на API-ключ. Скопируй его из настроек Platrum и вставь сюда.")
+        await update.message.reply_text("Это не похоже на API-ключ. Скопируй из настроек Platrum.")
         return WAITING_KEY
 
     msg = await update.message.reply_text("🔑 Проверяю ключ...")
@@ -308,17 +443,18 @@ async def receive_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             'owner_user_id': info['owner_user_id'],
             'name': tg_name,
             'registered_at': datetime.now().isoformat(),
+            'history': [],
         })
         await msg.edit_text(
             f"✅ Готово, {tg_name}!\n\n"
-            "Общайся со мной как с ассистентом по Platrum.\n"
-            "Говори голосом или пиши — пойму.\n\n"
+            "Общайся как с ассистентом — голосом, видеокружком или текстом.\n"
+            "Понимаю контекст, ставлю задачи, ищу, комментирую.\n\n"
             f"_(Создана тестовая задача #{info['test_task_id']} — можно удалить)_",
             parse_mode='Markdown'
         )
         log.info(f"User registered: {user_id} ({tg_name})")
     except Exception as e:
-        await msg.edit_text(f"❌ Ключ не подошёл: {e}\n\nПроверь ключ и попробуй ещё раз.")
+        await msg.edit_text(f"❌ Ключ не подошёл: {e}\n\nПроверь и попробуй ещё раз.")
         return WAITING_KEY
 
     return ConversationHandler.END
@@ -327,7 +463,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     if not user:
-        await update.message.reply_text("Сначала введи /start и добавь Platrum API-ключ.")
+        await update.message.reply_text("Введи /start и добавь API-ключ.")
         return
 
     msg = await update.message.reply_text("🎙 Распознаю...")
@@ -344,11 +480,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         Path(tmp_path).unlink(missing_ok=True)
 
         if not text.strip():
-            await msg.edit_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
+            await msg.edit_text("❌ Не удалось распознать речь.")
             return
 
-        await msg.edit_text(f"📝 _{text}_\n\n⏳ Обрабатываю...", parse_mode='Markdown')
-        await _handle_message(msg, text, user)
+        await msg.edit_text(f"📝 _{text}_\n\n⏳ Думаю...", parse_mode='Markdown')
+        await _process(msg, text, user, user_id)
 
     except Exception as e:
         log.exception(f"Voice error {user_id}")
@@ -358,144 +494,35 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = get_user(user_id)
     if not user:
-        await update.message.reply_text("Сначала введи /start и добавь Platrum API-ключ.")
+        await update.message.reply_text("Введи /start и добавь API-ключ.")
         return
 
     text = update.message.text.strip()
-    msg = await update.message.reply_text("⏳ Обрабатываю...")
-    await _handle_message(msg, text, user)
+    msg = await update.message.reply_text("⏳ Думаю...")
+    await _process(msg, text, user, user_id)
 
-async def _handle_message(msg, text: str, user: dict):
+async def _process(msg, text: str, user: dict, user_id: int):
     try:
-        intent_data = classify_intent(text, user['name'])
-        intent = intent_data.get('intent', 'chat')
-
-        if intent == 'create_task':
-            task = intent_data.get('task', {})
-            if not task or not task.get('name'):
-                await msg.edit_text("❓ Не понял задачу. Скажи что нужно сделать.")
-                return
-            result = create_platrum_task(task, user['api_key'])
-            task_id = result['id']
-            url = f"https://a96a08a.platrum.ru/tasks?taskId={task_id}"
-            parts = [f"✅ *{task['name']}*"]
-            if task.get('finish_date'):
-                parts.append(f"📅 {task['finish_date']}")
-            if task.get('is_important'):
-                parts.append("🔴 Срочная")
-            parts.append(f"[Открыть в Platrum]({url})")
-            await msg.edit_text('\n'.join(parts), parse_mode='Markdown')
-            log.info(f"Task {task_id} created by {user['name']}")
-
-        elif intent == 'find_task':
-            await msg.edit_text("🔍 Ищу задачу...")
-            task = _resolve_task(intent_data, user['api_key'])
-            if task:
-                url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
-                status = STATUS_LABELS.get(task.get('status_key', ''), task.get('status_key', '—'))
-                await msg.edit_text(
-                    f"*{task['name']}*\nСтатус: {status}\n[Открыть в Platrum]({url})",
-                    parse_mode='Markdown'
-                )
-            else:
-                await msg.edit_text("❌ Задача не найдена. Уточни название или номер.")
-
-        elif intent == 'add_comment':
-            comment_text = intent_data.get('comment_text', '').strip()
-            if not comment_text:
-                await msg.edit_text("❓ Не понял текст комментария.")
-                return
-            await msg.edit_text("💬 Ищу задачу...")
-            task = _resolve_task(intent_data, user['api_key'])
-            if task:
-                add_platrum_comment(task['id'], comment_text, user['api_key'])
-                url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
-                await msg.edit_text(
-                    f"✅ Комментарий добавлен в *{task['name']}*\n[Открыть в Platrum]({url})",
-                    parse_mode='Markdown'
-                )
-                log.info(f"Comment added to task {task['id']} by {user['name']}")
-            else:
-                await msg.edit_text("❌ Задача не найдена. Уточни название или номер.")
-
-        elif intent == 'change_status':
-            new_status = intent_data.get('new_status', '').strip()
-            if not new_status:
-                await msg.edit_text("❓ Не понял новый статус. Например: «выполнена», «в работе», «отменена».")
-                return
-            await msg.edit_text("🔍 Ищу задачу...")
-            task = _resolve_task(intent_data, user['api_key'])
-            if task:
-                update_platrum_task_status(task['id'], new_status, user['api_key'])
-                url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
-                label = STATUS_LABELS.get(new_status, new_status)
-                await msg.edit_text(
-                    f"✅ Статус задачи *{task['name']}* изменён на: {label}\n[Открыть в Platrum]({url})",
-                    parse_mode='Markdown'
-                )
-                log.info(f"Task {task['id']} status → {new_status} by {user['name']}")
-            else:
-                await msg.edit_text("❌ Задача не найдена. Уточни название или номер.")
-
-        elif intent == 'company_info':
-            await msg.edit_text("🏢 Загружаю структуру компании...")
-            structure = get_company_structure(user['api_key'])
-            query = intent_data.get('company_query', '')
-            if query:
-                # Let Claude filter the structure to answer the specific question
-                client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-                answer = client.messages.create(
-                    model='claude-haiku-4-5-20251001',
-                    max_tokens=400,
-                    messages=[{'role': 'user', 'content': (
-                        f'Структура компании:\n{structure}\n\n'
-                        f'Вопрос: {query}\n\n'
-                        f'Ответь кратко и конкретно по данным выше.'
-                    )}]
-                )
-                await msg.edit_text(answer.content[0].text.strip())
-            else:
-                await msg.edit_text(structure, parse_mode='Markdown')
-
-        else:  # chat
-            response = intent_data.get('chat_response') or 'Чем могу помочь?'
-            await msg.edit_text(response)
-
+        history = get_history(user_id)
+        response, new_history = chat_with_claude(text, user, history)
+        save_history(user_id, new_history)
+        await msg.edit_text(response)
     except Exception as e:
-        log.exception(f"Handle message error for {user.get('name')}")
+        log.exception(f"Process error for {user.get('name')}")
         await msg.edit_text(f"❌ Ошибка: {e}")
-
-def _resolve_task(intent_data: dict, api_key: str) -> dict | None:
-    task_id = intent_data.get('task_id')
-    if task_id:
-        try:
-            task = get_platrum_task(int(task_id), api_key)
-            if task:
-                return task
-        except Exception:
-            pass
-    query = intent_data.get('task_query', '').strip()
-    if query:
-        tasks = search_platrum_tasks(query, api_key)
-        if tasks:
-            return tasks[0]
-    return None
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Что умею:\n\n"
-        "📋 *Задачи*\n"
-        "— Поставить задачу (голос/текст)\n"
-        "— Найти задачу, получить ссылку\n"
-        "— Добавить комментарий\n"
-        "— Изменить статус (выполнена / в работе / отменена)\n\n"
-        "🏢 *Компания*\n"
-        "— Показать структуру компании\n"
-        "— Кто занимает какую должность\n\n"
-        "💬 *Общение*\n"
-        "— Ответить на вопрос\n\n"
-        "Команды: /start /reset /help",
-        parse_mode='Markdown'
+        "📋 Поставить задачу в Platrum\n"
+        "🔍 Найти задачу, прислать ссылку\n"
+        "💬 Добавить комментарий\n"
+        "✅ Изменить статус задачи\n"
+        "🏢 Показать структуру компании\n"
+        "🗣 Ответить на вопрос\n\n"
+        "Помню контекст разговора — можно говорить как с человеком.\n\n"
+        "/clear — сбросить историю разговора\n"
+        "/reset — сменить API-ключ"
     )
 
 # ─────────────── MAIN ───────────────
@@ -517,6 +544,7 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CommandHandler('help', cmd_help))
+    app.add_handler(CommandHandler('clear', cmd_clear))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
