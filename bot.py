@@ -25,18 +25,16 @@ import anthropic
 BOT_TOKEN     = os.environ['BOT_TOKEN']
 ANTHROPIC_KEY = os.environ['ANTHROPIC_API_KEY']
 PLATRUM_HOST  = 'a96a08a.platrum.ru'
-DATA_FILE     = Path('/opt/platrum-bot/data/users.json')
-LOG_FILE      = Path('/opt/platrum-bot/data/bot.log')
+DATA_DIR      = Path(os.environ.get('DATA_DIR', '/app/data'))
+DATA_FILE     = DATA_DIR / 'users.json'
 
 WAITING_KEY = 1
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
 
