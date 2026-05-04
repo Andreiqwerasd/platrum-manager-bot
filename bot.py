@@ -385,6 +385,21 @@ def execute_tool(name: str, inp: dict, api_key: str) -> str:
     except Exception as e:
         return f"Ошибка при выполнении {name}: {e}"
 
+def _serialize_content(content) -> list:
+    """Convert Anthropic content blocks to JSON-serializable dicts for history storage."""
+    result = []
+    for block in (content if isinstance(content, list) else [content]):
+        if isinstance(block, dict):
+            result.append(block)
+        elif hasattr(block, 'type'):
+            if block.type == 'text':
+                result.append({"type": "text", "text": block.text})
+            elif block.type == 'tool_use':
+                result.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+            else:
+                result.append({"type": block.type})
+    return result
+
 # ─────────────── AGENTIC LOOP ───────────────
 def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, list]:
     today = datetime.now().strftime('%Y-%m-%d')
@@ -411,21 +426,22 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
             messages=messages
         )
 
-        messages.append({"role": "assistant", "content": response.content})
+        serialized = _serialize_content(response.content)
+        messages.append({"role": "assistant", "content": serialized})
 
         if response.stop_reason == 'end_turn':
-            text = ' '.join(b.text for b in response.content if hasattr(b, 'text') and b.text)
+            text = ' '.join(b.get('text', '') for b in serialized if b.get('type') == 'text')
             return text.strip() or '✓', messages
 
         if response.stop_reason == 'tool_use':
             tool_results = []
-            for block in response.content:
-                if block.type == 'tool_use':
-                    log.info(f"Tool call: {block.name}({block.input})")
-                    result = execute_tool(block.name, block.input, user['api_key'])
+            for block in serialized:
+                if block.get('type') == 'tool_use':
+                    log.info(f"Tool call: {block['name']}({block['input']})")
+                    result = execute_tool(block['name'], block['input'], user['api_key'])
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "tool_use_id": block['id'],
                         "content": result
                     })
             messages.append({"role": "user", "content": tool_results})
