@@ -31,6 +31,52 @@ MAX_HISTORY   = 20   # messages per user to keep
 
 WAITING_KEY = 1
 
+# Словарь сотрудников компании: фамилия → Platrum user_id
+USERS = {
+    'белов':           '77b396c84ea1b2cc02265335f8030b97',
+    'голицын':         'b7f1c9768b7abdd0f62336f8a065b6cc',
+    'митасов':         '0c1fbc0b5af1e27f03ae70eea6739d32',
+    'кулешов':         '95f7ae5c723cea0cee906fe7ac15f9ab',
+    'иванов иван к':   '0881b82513dc98290cbbf1aab8996309',
+    'кукушкин':        '6e4a6da36e202c35120b1d546ddb2c68',
+    'семенова':        'a40e2e4cd256a2ebbae2f142b502256c',
+    'бизяев':          'b80344ba9ca6f374cf02448214719f45',
+    'гаврилов':        '8669e3b12949c4ae7af00218ff5d7fc3',
+    'манукян':         'a4bab15349d3a3a0af3fccf7dcc3f295',
+    'зенько':          '6f20d54e55135d3885883b447d200e86',
+    'овчинников':      '4e9044a80baf834ad80dfa5f2463c872',
+    'старцев':         '0d33e9fda313751ce8860a4efe9c2d51',
+    'нагимов':         'b5544889b47c490277fa6269c12b50e3',
+    'шиманский':       '6058ad85d55465f544de689afaa2845e',
+    'савинков':        'c0d5ce73ecbf439d27a3bbbde9cdb296',
+    'арбузов':         '1981272c6f92a9b90fe21fb03e6cf631',
+    'ивин':            'f90618dd151b6356cd646bbe9f5ffce1',
+    'удовидчик':       'd7e9948d56de32bf33ababf07c04cdc9',
+    'земсков':         '2c87d4ba4f89b5be2bf2145c1c48a2db',
+    'ващенко':         'd879c3cdc0ed31ef92167c130e11180a',
+    'фомин':           '41be7997009a2fc1bc7694f7a3a33103',
+    'михалкин':        '06694ff13a17e76baf49090c4bd2b461',
+    'молодыченко':     '936f3a7dfd7049a38cb6e649226e4d9a',
+    'верзаков':        '37da25c9146902318218a0cbf94116a3',
+    'деминский':       'e0611c5fdc16b4c3f953dfd24014b7e7',
+    'воеводов':        'eabedd764f1601982493c0ee0d823ed8',
+    'кин':             '21244a43083be900e89111535ac11ebb',
+    'банщиков':        '01831b6b848ddac92dddd053a2680d84',
+    'гелаш':           '31f63717756921b24231ae6e9393d807',
+    'арефьев':         'd6b713772c40ff506db1c9f175ddc314',
+    'иванов виктор':   'd1bb3c2c6bdbbe56a268b582b211ec58',
+}
+
+def find_user_id(name: str) -> str | None:
+    """Ищет user_id по части имени/фамилии (нечёткий поиск)."""
+    if not name:
+        return None
+    name_lower = name.lower().strip()
+    for key, uid in USERS.items():
+        if key in name_lower or name_lower in key:
+            return uid
+    return None
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -128,12 +174,23 @@ def _create_task(inp: dict, api_key: str) -> str:
         body['finish_date'] = inp['finish_date']
     if inp.get('is_important'):
         body['is_important'] = True
+
+    responsible_name = inp.get('responsible', '').strip()
+    responsible_note = ''
+    if responsible_name:
+        uid = find_user_id(responsible_name)
+        if uid:
+            body['responsible_user_ids'] = [uid]
+            responsible_note = f"\nИсполнитель: {responsible_name}"
+        else:
+            responsible_note = f"\n⚠️ Исполнитель «{responsible_name}» не найден в системе"
+
     data = _platrum_post('/tasks/api/task/create', body, api_key)
     if data.get('status') != 'success':
         return f"Ошибка: {data.get('error_message') or data.get('error')}"
     task = data['data']
     url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
-    return f"Задача создана: #{task['id']}\nНазвание: {task['name']}\nСсылка: {url}"
+    return f"Задача создана: #{task['id']}\nНазвание: {task['name']}{responsible_note}\nСсылка: {url}"
 
 def _find_task(inp: dict, api_key: str) -> str:
     task_id = inp.get('task_id')
@@ -257,7 +314,8 @@ TOOLS = [
                 "name": {"type": "string", "description": "Краткое название задачи (до 100 символов)"},
                 "description": {"type": "string", "description": "Описание, детали, контекст задачи"},
                 "finish_date": {"type": "string", "description": "Дедлайн в формате YYYY-MM-DD"},
-                "is_important": {"type": "boolean", "description": "True если задача срочная или важная"}
+                "is_important": {"type": "boolean", "description": "True если задача срочная или важная"},
+                "responsible": {"type": "string", "description": "Исполнитель задачи — фамилия или часть имени сотрудника (например: Голицын, Митасов, Кулешов)"}
             },
             "required": ["name"]
         }
