@@ -11,6 +11,7 @@ import re
 import logging
 import tempfile
 import subprocess
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 
@@ -158,6 +159,39 @@ def _platrum_post(path: str, body: dict, api_key: str) -> dict:
     chunks = re.findall(rb'[0-9a-f]+\r\n(.+?)\r\n', raw, re.DOTALL)
     return json.loads(b''.join(chunks).decode() if chunks else raw.decode())
 
+def _platrum_upload_file(file_bytes: bytes, filename: str, content_type: str, api_key: str) -> str:
+    """Upload raw file to Platrum, returns file_id."""
+    path = f'/file/upload?format=json&file_name={urllib.parse.quote(filename)}&module=tasks'
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    req = (
+        f'POST {path} HTTP/1.1\r\n'
+        f'Host: {PLATRUM_HOST}\r\n'
+        f'Api-key: {api_key}\r\n'
+        f'Content-Type: {content_type}\r\n'
+        f'Content-Length: {len(file_bytes)}\r\n'
+        f'Connection: close\r\n\r\n'
+    ).encode() + file_bytes
+
+    with socket.create_connection((PLATRUM_HOST, 443), timeout=60) as sock:
+        with ctx.wrap_socket(sock, server_hostname=PLATRUM_HOST) as ssock:
+            ssock.sendall(req)
+            resp = b''
+            while True:
+                chunk = ssock.recv(8192)
+                if not chunk:
+                    break
+                resp += chunk
+
+    _, _, raw = resp.partition(b'\r\n\r\n')
+    chunks = re.findall(rb'[0-9a-f]+\r\n(.+?)\r\n', raw, re.DOTALL)
+    data = json.loads(b''.join(chunks).decode() if chunks else raw.decode())
+    if data.get('status') != 'success':
+        raise ValueError(data.get('error_message') or data.get('error') or 'File upload failed')
+    return data['data']['id']
+
 def verify_platrum_key(api_key: str) -> dict:
     data = _platrum_post('/tasks/api/task/create',
                          {'name': '🤖 Тест подключения бота (можно удалить)'}, api_key)
@@ -286,6 +320,19 @@ def _get_company_structure(api_key: str) -> str:
 
     return '\n'.join(lines)
 
+def _attach_file_to_task(inp: dict, api_key: str) -> str:
+    task = _resolve_task_from_input(inp, api_key)
+    if not task:
+        return "Задача не найдена. Укажи название или ID."
+    file_id = inp.get('file_id', '').strip()
+    if not file_id:
+        return "Не передан file_id."
+    data = _platrum_post('/tasks/api/task/update', {'id': task['id'], 'file_ids': [file_id]}, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка прикрепления файла: {data.get('error_message')}"
+    url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
+    return f"Файл прикреплён к задаче \"{task['name']}\"\nСсылка: {url}"
+
 def _resolve_task_from_input(inp: dict, api_key: str) -> dict | None:
     task_id = inp.get('task_id')
     if task_id:
@@ -365,6 +412,19 @@ TOOLS = [
         "name": "get_company_structure",
         "description": "Показать организационную структуру компании: должности и сотрудники.",
         "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "attach_file_to_task",
+        "description": "Прикрепить загруженный файл/фото к существующей задаче в Platrum.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string", "description": "ID файла в Platrum (передаётся системой при загрузке фото)"},
+                "task_query": {"type": "string", "description": "Название задачи для поиска"},
+                "task_id": {"type": "integer", "description": "ID задачи если известен"}
+            },
+            "required": ["file_id"]
+        }
     }
 ]
 
@@ -380,6 +440,8 @@ def execute_tool(name: str, inp: dict, api_key: str) -> str:
             return _change_status(inp, api_key)
         elif name == 'get_company_structure':
             return _get_company_structure(api_key)
+        elif name == 'attach_file_to_task':
+            return _attach_file_to_task(inp, api_key)
         else:
             return f"Неизвестный инструмент: {name}"
     except Exception as e:
@@ -542,6 +604,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("🎙 Распознаю...")
 
+    tmp_path = None
     try:
         voice = update.message.voice or update.message.video_note
         voice_file = await ctx.bot.get_file(voice.file_id)
@@ -551,7 +614,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await voice_file.download_to_drive(tmp_path)
 
         text = transcribe_audio(tmp_path)
-        Path(tmp_path).unlink(missing_ok=True)
 
         if not text.strip():
             await msg.edit_text("❌ Не удалось распознать речь.")
@@ -563,6 +625,47 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"Voice error {user_id}")
         await msg.edit_text(f"❌ Ошибка: {e}")
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    if not user:
+        await update.message.reply_text("Введи /start и добавь API-ключ.")
+        return
+
+    msg = await update.message.reply_text("📷 Загружаю фото в Platrum...")
+    tmp_path = None
+    try:
+        photo = update.message.photo[-1]  # largest resolution
+        caption = update.message.caption or ''
+
+        photo_file = await ctx.bot.get_file(photo.file_id)
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False, dir='/tmp') as f:
+            tmp_path = f.name
+        await photo_file.download_to_drive(tmp_path)
+
+        file_bytes = Path(tmp_path).read_bytes()
+        filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        file_id = _platrum_upload_file(file_bytes, filename, 'image/jpeg', user['api_key'])
+
+        prompt = f"[Система: пользователь отправил фото, оно загружено в Platrum, file_id={file_id}]"
+        if caption:
+            prompt += f" Подпись: {caption}"
+        else:
+            prompt += " Уточни у пользователя, к какой задаче прикрепить это фото, затем вызови attach_file_to_task."
+
+        await msg.edit_text("📷 Фото загружено. Думаю...")
+        await _process(msg, prompt, user, user_id)
+
+    except Exception as e:
+        log.exception(f"Photo error {user_id}")
+        await msg.edit_text(f"❌ Ошибка загрузки фото: {e}")
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -620,6 +723,7 @@ def main():
     app.add_handler(CommandHandler('help', cmd_help))
     app.add_handler(CommandHandler('clear', cmd_clear))
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info('Bot started')
