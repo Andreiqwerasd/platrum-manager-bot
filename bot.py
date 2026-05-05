@@ -161,7 +161,17 @@ def save_history(user_id: int, history: list):
     users = load_users()
     uid = str(user_id)
     if uid in users:
-        users[uid]['history'] = history[-MAX_HISTORY:]
+        trimmed = history[-MAX_HISTORY:]
+        # Don't start with orphaned tool_results (no matching tool_use)
+        while trimmed:
+            first = trimmed[0]
+            if (first.get('role') == 'user' and
+                    isinstance(first.get('content'), list) and
+                    any(c.get('type') == 'tool_result' for c in first['content'])):
+                trimmed = trimmed[1:]
+            else:
+                break
+        users[uid]['history'] = trimmed
         save_users(users)
 
 # ─────────────── PLATRUM API ───────────────
@@ -848,14 +858,26 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
 
     messages = list(history) + [{"role": "user", "content": user_text}]
 
-    for _ in range(8):  # max 8 tool call rounds
-        response = client.messages.create(
+    def _do_request(msgs):
+        return client.messages.create(
             model='claude-sonnet-4-6',
             max_tokens=2000,
             system=system,
             tools=TOOLS,
-            messages=messages
+            messages=msgs
         )
+
+    for _ in range(8):  # max 8 tool call rounds
+        try:
+            response = _do_request(messages)
+        except Exception as e:
+            # Orphaned tool_result in history — clear and retry once
+            if 'tool_use_id' in str(e) or 'tool_result' in str(e):
+                log.warning(f"Corrupted history detected, retrying clean: {e}")
+                messages = [{"role": "user", "content": user_text}]
+                response = _do_request(messages)
+            else:
+                raise
 
         serialized = _serialize_content(response.content)
         messages.append({"role": "assistant", "content": serialized})
