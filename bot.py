@@ -454,8 +454,17 @@ def _search_wiki(inp: dict, api_key: str) -> str:
 
     if query:
         q_lower = query.lower()
-        filtered = [a for a in articles if q_lower in (a.get('title') or '').lower()]
-        articles = filtered[:8] if filtered else articles[:8]
+        # Split into words to handle Russian morphology (начальник vs начальника etc.)
+        query_words = [w for w in q_lower.split() if len(w) > 3]
+        if query_words:
+            # All major words must appear in title (handles inflection)
+            filtered = [a for a in articles if all(w in (a.get('title') or '').lower() for w in query_words)]
+            # Fallback: any of the words
+            if not filtered:
+                filtered = [a for a in articles if any(w in (a.get('title') or '').lower() for w in query_words)]
+        else:
+            filtered = [a for a in articles if q_lower in (a.get('title') or '').lower()]
+        articles = filtered[:10] if filtered else articles[:8]
     else:
         articles = articles[:8]
 
