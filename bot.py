@@ -308,7 +308,13 @@ def _change_status(inp: dict, api_key: str) -> str:
     new_status = inp.get('status', '').strip()
     if not new_status:
         return "Не указан новый статус."
-    data = _platrum_post('/tasks/api/task/update', {'id': task['id'], 'status_key': new_status}, api_key)
+    data = _platrum_post('/tasks/api/task/update', {
+        'id': task['id'],
+        'fields': {'status_key': new_status},
+        'fields_old': {'status_key': task.get('status_key')},
+        'is_edit_further': None,
+        'start_date_from_plan': None
+    }, api_key)
     if data.get('status') != 'success':
         return f"Ошибка изменения статуса: {data.get('error_message')}"
     status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
@@ -319,23 +325,42 @@ def _update_task(inp: dict, api_key: str) -> str:
     task = _resolve_task_from_input(inp, api_key)
     if not task:
         return "Задача не найдена. Укажи название или ID."
-    body = {'id': task['id']}
+
+    # Fetch full task to get current field values for fields_old
+    full = _platrum_post('/tasks/api/task/get', {'id': task['id']}, api_key)
+    if full.get('status') != 'success':
+        return f"Не удалось получить задачу: {full.get('error_message')}"
+    current = full['data']
+
+    fields_new = {}
+    fields_old = {}
     updated = []
     for field in ('name', 'description', 'product', 'finish_date', 'is_important'):
         if inp.get(field) is not None:
-            body[field] = inp[field]
+            fields_new[field] = inp[field]
+            fields_old[field] = current.get(field)
             updated.append(field)
+
     responsible_name = inp.get('responsible', '').strip()
     if responsible_name:
         uid = find_user_id(responsible_name)
         if uid:
-            body['responsible_user_ids'] = [uid]
+            fields_new['responsible_user_ids'] = [uid]
+            fields_old['responsible_user_ids'] = current.get('responsible_user_ids', [])
             updated.append(f'исполнитель={responsible_name}')
         else:
             return f"⚠️ Исполнитель «{responsible_name}» не найден в системе"
-    if len(body) <= 1:
+
+    if not fields_new:
         return "Не указаны поля для обновления."
-    data = _platrum_post('/tasks/api/task/update', body, api_key)
+
+    data = _platrum_post('/tasks/api/task/update', {
+        'id': task['id'],
+        'fields': fields_new,
+        'fields_old': fields_old,
+        'is_edit_further': None,
+        'start_date_from_plan': None
+    }, api_key)
     if data.get('status') != 'success':
         return f"Ошибка обновления задачи: {data.get('error_message')}"
     url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
