@@ -87,6 +87,40 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ─────────────── SKILLS LOADER ───────────────
+SKILL_CONTEXT = ''
+
+def _load_skill(skill_path: str) -> str:
+    url = f"https://raw.githubusercontent.com/Andreiqwerasd/claude-knowledge/main/{skill_path}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'platrum-bot/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            content = r.read().decode('utf-8')
+        # Strip YAML frontmatter
+        if content.startswith('---'):
+            parts = content.split('---', 2)
+            if len(parts) >= 3:
+                content = parts[2].strip()
+        return content
+    except Exception as e:
+        log.warning(f"Skill load failed {skill_path}: {e}")
+        return ''
+
+def load_all_skills() -> str:
+    global SKILL_CONTEXT
+    skills = {
+        'company-context': 'skills/company-context/SKILL.md',
+        'platrum-tasks':   'skills/platrum-tasks/SKILL.md',
+    }
+    parts = []
+    for name, path in skills.items():
+        content = _load_skill(path)
+        if content:
+            parts.append(f"# Скилл: {name}\n\n{content}")
+            log.info(f"Loaded skill {name} ({len(content)} chars)")
+    SKILL_CONTEXT = '\n\n---\n\n'.join(parts)
+    log.info(f"Skills loaded: {len(SKILL_CONTEXT)} total chars")
+
 _whisper_model = None
 
 def get_whisper():
@@ -752,6 +786,7 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
         "## Стиль\n"
         "При создании задачи — название конкретное и action-oriented.\n"
         "После инструментов — краткий ответ без технических деталей."
+        + (f"\n\n---\n\n{SKILL_CONTEXT}" if SKILL_CONTEXT else "")
     )
 
     messages = list(history) + [{"role": "user", "content": user_text}]
@@ -919,8 +954,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("❌ Не удалось распознать речь.")
             return
 
-        await msg.edit_text(f"📝 _{text}_\n\n⏳ Думаю...", parse_mode='Markdown')
-        await _process(msg, text, user, user_id)
+        # Keep transcription visible, process in a new message
+        await msg.edit_text(f"🎤 Расшифровал: «{text}»")
+        reply_msg = await update.message.reply_text("⏳ Думаю...")
+        await _process(reply_msg, text, user, user_id)
 
     except Exception as e:
         log.exception(f"Voice error {user_id}")
@@ -1009,6 +1046,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────── MAIN ───────────────
 def main():
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    load_all_skills()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
