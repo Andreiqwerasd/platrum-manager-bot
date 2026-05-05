@@ -12,6 +12,7 @@ import logging
 import tempfile
 import subprocess
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -93,7 +94,7 @@ def get_whisper():
     if _whisper_model is None:
         from faster_whisper import WhisperModel
         log.info("Loading Whisper model...")
-        _whisper_model = WhisperModel('base', device='cpu', compute_type='int8')
+        _whisper_model = WhisperModel('medium', device='cpu', compute_type='int8')
     return _whisper_model
 
 # ─────────────── USER STORAGE ───────────────
@@ -200,6 +201,7 @@ def verify_platrum_key(api_key: str) -> dict:
     task = data['data']
     return {'owner_user_id': task['owner_user_id'], 'test_task_id': task['id']}
 
+# ─────────────── PLATRUM TASKS ───────────────
 def _create_task(inp: dict, api_key: str) -> str:
     body = {'name': inp['name']}
     if inp.get('description'):
@@ -350,11 +352,152 @@ def _resolve_task_from_input(inp: dict, api_key: str) -> dict | None:
                 return tasks[0]
     return None
 
+# ─────────────── PLATRUM WIKI ───────────────
+def _search_wiki(inp: dict, api_key: str) -> str:
+    query = inp.get('query', '').strip()
+    body = {'search': query} if query else {}
+    data = _platrum_post('/wiki/api/article/list', body, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка поиска в базе знаний: {data.get('error_message', data.get('error', ''))}"
+
+    articles = data.get('data', [])
+    if isinstance(articles, dict):
+        articles = list(articles.values()) if articles else []
+    articles = [a for a in articles if isinstance(a, dict)]
+
+    if query:
+        q_lower = query.lower()
+        filtered = [a for a in articles if q_lower in a.get('name', '').lower()]
+        articles = filtered[:8] if filtered else articles[:8]
+    else:
+        articles = articles[:8]
+
+    if not articles:
+        return f"Статьи по запросу «{query}» не найдены в базе знаний."
+
+    lines = [f"📚 База знаний — найдено {len(articles)} статей:\n"]
+    for a in articles:
+        article_id = a.get('id', '?')
+        name = a.get('name', 'Без названия')
+        url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+        lines.append(f"• {name} (ID: {article_id})\n  {url}")
+
+    return '\n'.join(lines)
+
+def _get_wiki_article(inp: dict, api_key: str) -> str:
+    article_id = inp.get('article_id')
+    if not article_id:
+        return "Не указан ID статьи."
+
+    data = _platrum_post('/wiki/api/article/get', {'id': int(article_id)}, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка получения статьи: {data.get('error_message', '')}"
+
+    article = data.get('data', {})
+    name = article.get('name', 'Без названия')
+    text = article.get('text', '')
+    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+
+    if text:
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) > 3000:
+            text = text[:3000] + '...'
+
+    return f"📄 {name}\nСсылка: {url}\n\n{text or '(пусто)'}"
+
+def _create_wiki_article(inp: dict, api_key: str) -> str:
+    name = inp.get('name', '').strip()
+    text = inp.get('text', '').strip()
+    parent_id = inp.get('parent_id')
+
+    if not name:
+        return "Не указано название статьи."
+
+    body = {'name': name, 'text': text}
+    if parent_id:
+        body['parent_id'] = int(parent_id)
+
+    data = _platrum_post('/wiki/api/article/save', body, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка создания статьи: {data.get('error_message', '')}"
+
+    article = data.get('data', {})
+    article_id = article.get('id', '?')
+    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+    return f"✅ Статья создана: «{name}»\nID: {article_id}\nСсылка: {url}"
+
+def _update_wiki_article(inp: dict, api_key: str) -> str:
+    article_id = inp.get('article_id')
+    name = inp.get('name', '').strip()
+    text = inp.get('text', '').strip()
+
+    if not article_id:
+        return "Не указан ID статьи."
+
+    current = _platrum_post('/wiki/api/article/get', {'id': int(article_id)}, api_key)
+    if current.get('status') != 'success':
+        return f"Статья {article_id} не найдена."
+
+    article = current.get('data', {})
+    body = {
+        'id': int(article_id),
+        'name': name or article.get('name', ''),
+        'text': text or article.get('text', ''),
+    }
+
+    data = _platrum_post('/wiki/api/article/save', body, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка обновления статьи: {data.get('error_message', '')}"
+
+    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+    return f"✅ Статья обновлена: «{name or article.get('name', '')}»\nСсылка: {url}"
+
+# ─────────────── WEB SEARCH ───────────────
+def _web_search(inp: dict) -> str:
+    query = inp.get('query', '').strip()
+    if not query:
+        return "Не указан поисковый запрос."
+
+    url = (f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}"
+           f"&format=json&no_redirect=1&no_html=1&skip_disambig=1")
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={'User-Agent': 'Mozilla/5.0 (compatible; PlatrumBot/1.0)'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        results = []
+        if data.get('AbstractText'):
+            results.append(f"📌 {data['AbstractText'][:600]}")
+            if data.get('AbstractURL'):
+                results.append(f"   Источник: {data['AbstractURL']}")
+
+        if data.get('Answer'):
+            results.append(f"💡 {data['Answer']}")
+
+        for topic in data.get('RelatedTopics', [])[:5]:
+            if isinstance(topic, dict) and topic.get('Text'):
+                text = topic['Text'][:250]
+                first_url = topic.get('FirstURL', '')
+                results.append(f"• {text}")
+                if first_url:
+                    results.append(f"  🔗 {first_url}")
+
+        if not results:
+            return f"По запросу «{query}» прямого ответа не найдено. Попробуй уточнить запрос."
+
+        return f"🔍 Поиск «{query}»:\n\n" + '\n'.join(results)
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
+
 # ─────────────── CLAUDE TOOLS DEFINITION ───────────────
 TOOLS = [
     {
         "name": "create_task",
-        "description": "Создать задачу в Platrum CRM от имени пользователя. Вызывай ТОЛЬКО когда пользователь явно хочет поставить задачу.",
+        "description": "Создать задачу в Platrum CRM от имени пользователя. Вызывай когда пользователь явно хочет поставить задачу или согласился на создание.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -380,7 +523,7 @@ TOOLS = [
     },
     {
         "name": "add_comment",
-        "description": "Добавить комментарий к существующей задаче в Platrum.",
+        "description": "Добавить комментарий к существующей задаче в Platrum. Используй для сохранения важного контекста разговора.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -425,6 +568,65 @@ TOOLS = [
             },
             "required": ["file_id"]
         }
+    },
+    {
+        "name": "search_wiki",
+        "description": "Поиск статей в базе знаний компании (Platrum Wiki). Используй для корпоративной информации: регламентов, инструкций, процессов.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поисковый запрос — ключевые слова или название статьи"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "get_wiki_article",
+        "description": "Получить полный текст статьи из базы знаний по её ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "article_id": {"type": "integer", "description": "ID статьи из результатов search_wiki"}
+            },
+            "required": ["article_id"]
+        }
+    },
+    {
+        "name": "create_wiki_article",
+        "description": "Создать новую статью в базе знаний компании Platrum Wiki.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Название статьи"},
+                "text": {"type": "string", "description": "Текст статьи (можно использовать HTML)"},
+                "parent_id": {"type": "integer", "description": "ID родительского раздела (необязательно)"}
+            },
+            "required": ["name", "text"]
+        }
+    },
+    {
+        "name": "update_wiki_article",
+        "description": "Обновить существующую статью в базе знаний Platrum Wiki.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "article_id": {"type": "integer", "description": "ID статьи для обновления"},
+                "name": {"type": "string", "description": "Новое название (оставь пустым чтобы не менять)"},
+                "text": {"type": "string", "description": "Новый текст статьи"}
+            },
+            "required": ["article_id"]
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Поиск информации в интернете через DuckDuckGo. Используй когда нужна внешняя информация: цены, нормы, справочные данные, определения.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поисковый запрос на русском или английском"}
+            },
+            "required": ["query"]
+        }
     }
 ]
 
@@ -442,6 +644,16 @@ def execute_tool(name: str, inp: dict, api_key: str) -> str:
             return _get_company_structure(api_key)
         elif name == 'attach_file_to_task':
             return _attach_file_to_task(inp, api_key)
+        elif name == 'search_wiki':
+            return _search_wiki(inp, api_key)
+        elif name == 'get_wiki_article':
+            return _get_wiki_article(inp, api_key)
+        elif name == 'create_wiki_article':
+            return _create_wiki_article(inp, api_key)
+        elif name == 'update_wiki_article':
+            return _update_wiki_article(inp, api_key)
+        elif name == 'web_search':
+            return _web_search(inp)
         else:
             return f"Неизвестный инструмент: {name}"
     except Exception as e:
@@ -470,19 +682,31 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
     system = (
         f"Ты — личный Platrum-ассистент руководителя {user['name']} в компании по продаже б/у автозапчастей.\n"
         f"Сегодня: {today}.\n\n"
-        "Отвечай по-русски, кратко и по делу — как опытный бизнес-ассистент.\n"
-        "Используй инструменты ТОЛЬКО когда пользователь явно просит создать/найти/изменить задачу или узнать структуру.\n"
-        "Если это просто вопрос или разговор — отвечай напрямую без инструментов.\n"
-        "При создании задачи улучшай формулировку: делай название конкретным и action-oriented.\n"
-        "После выполнения инструмента дай краткий содержательный ответ, не пересказывай технические детали."
+        "Отвечай по-русски, кратко и по делу.\n\n"
+        "## Инструменты\n"
+        "• Задачи: create_task, find_task, add_comment, change_task_status, attach_file_to_task\n"
+        "• Структура компании: get_company_structure\n"
+        "• База знаний: search_wiki (поиск), get_wiki_article (читать), "
+        "create_wiki_article (создать), update_wiki_article (изменить)\n"
+        "• Интернет: web_search — когда нужна внешняя справочная информация\n\n"
+        "## Правило создания задач\n"
+        "Когда руководитель обсуждает рабочую ситуацию, проблему или использует тебя как поисковик — "
+        "в конце ответа предложи: «Создать задачу на эту тему?»\n"
+        "Если соглашается — создай задачу, ответственным поставь его (или кого укажет).\n"
+        "Важный контекст разговора сохраняй как комментарии через add_comment.\n\n"
+        "## База знаний\n"
+        "По вопросам о регламентах, процессах и правилах компании — сначала ищи в базе знаний.\n\n"
+        "## Стиль\n"
+        "При создании задачи — название конкретное и action-oriented.\n"
+        "После инструментов — краткий ответ без технических деталей."
     )
 
     messages = list(history) + [{"role": "user", "content": user_text}]
 
-    for _ in range(5):  # max 5 tool call rounds
+    for _ in range(8):  # max 8 tool call rounds
         response = client.messages.create(
             model='claude-haiku-4-5-20251001',
-            max_tokens=1000,
+            max_tokens=1500,
             system=system,
             tools=TOOLS,
             messages=messages
@@ -511,18 +735,41 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
     return "Не смог обработать запрос. Попробуй ещё раз.", messages
 
 # ─────────────── TRANSCRIPTION ───────────────
+def cleanup_transcription(raw_text: str) -> str:
+    """Use Claude Haiku to fix transcription errors and add punctuation."""
+    if not raw_text:
+        return raw_text
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=1024,
+            messages=[{
+                'role': 'user',
+                'content': (
+                    'Это автоматическая расшифровка голосового сообщения на русском языке. '
+                    'Исправь ошибки распознавания, восстанови пропущенные слова по контексту, '
+                    'расставь знаки препинания. Верни только исправленный текст, без пояснений.\n\n'
+                    f'Расшифровка: {raw_text}'
+                )
+            }]
+        )
+        return msg.content[0].text.strip()
+    except Exception:
+        return raw_text
+
 def transcribe_audio(file_path: str) -> str:
     path = Path(file_path)
-    mp3_path = path.with_suffix('.mp3')
+    wav_path = path.with_suffix('.wav')
     subprocess.run(
-        ['ffmpeg', '-y', '-i', str(path), '-ar', '16000', '-ac', '1', str(mp3_path)],
+        ['ffmpeg', '-y', '-i', str(path), '-ar', '16000', '-ac', '1', '-vn', str(wav_path)],
         capture_output=True, check=True
     )
     model = get_whisper()
-    segments, _ = model.transcribe(str(mp3_path), language='ru', beam_size=1)
-    text = ' '.join(s.text for s in segments).strip()
-    mp3_path.unlink(missing_ok=True)
-    return text
+    segments, _ = model.transcribe(str(wav_path), language='ru', beam_size=5)
+    raw_text = ' '.join(s.text for s in segments).strip()
+    wav_path.unlink(missing_ok=True)
+    return cleanup_transcription(raw_text)
 
 # ─────────────── TELEGRAM HANDLERS ───────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -532,8 +779,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     if user:
         await update.message.reply_text(
             f"Привет, {user['name']}! 👋\n\n"
-            "Говори голосом, видеокружком или пиши — помогу с Platrum.\n"
-            "Понимаю контекст разговора, создаю задачи, ищу, комментирую, меняю статусы.\n\n"
+            "Говори голосом, видеокружком или пиши — помогу с Platrum и не только.\n"
+            "Ставлю задачи, ищу в базе знаний, гуглю, помню контекст.\n\n"
             "/reset — сменить API-ключ  /clear — очистить историю  /help — справка"
         )
         return ConversationHandler.END
@@ -584,7 +831,7 @@ async def receive_api_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
         await msg.edit_text(
             f"✅ Готово, {tg_name}!\n\n"
             "Общайся как с ассистентом — голосом, видеокружком или текстом.\n"
-            "Понимаю контекст, ставлю задачи, ищу, комментирую.\n\n"
+            "Ставлю задачи, ищу в базе знаний, гуглю, помню контекст.\n\n"
             f"_(Создана тестовая задача #{info['test_task_id']} — можно удалить)_",
             parse_mode='Markdown'
         )
@@ -691,13 +938,17 @@ async def _process(msg, text: str, user: dict, user_id: int):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Что умею:\n\n"
-        "📋 Поставить задачу в Platrum\n"
-        "🔍 Найти задачу, прислать ссылку\n"
-        "💬 Добавить комментарий\n"
-        "✅ Изменить статус задачи\n"
-        "🏢 Показать структуру компании\n"
-        "🗣 Ответить на вопрос\n\n"
-        "Помню контекст разговора — можно говорить как с человеком.\n\n"
+        "📋 Ставить задачи в Platrum\n"
+        "🔍 Искать задачи, присылать ссылки\n"
+        "💬 Добавлять комментарии к задачам\n"
+        "✅ Менять статусы задач\n"
+        "🏢 Показывать структуру компании\n"
+        "📚 Искать и читать базу знаний\n"
+        "✏️ Создавать и редактировать статьи\n"
+        "🌐 Искать информацию в интернете\n"
+        "🗣 Отвечать на вопросы\n\n"
+        "Помню контекст разговора.\n"
+        "По рабочим темам предлагаю создать задачу и сохраняю переписку в комментарии.\n\n"
         "/clear — сбросить историю разговора\n"
         "/reset — сменить API-ключ"
     )
