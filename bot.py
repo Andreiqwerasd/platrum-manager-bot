@@ -426,7 +426,19 @@ def _attach_file_to_task(inp: dict, api_key: str) -> str:
     file_id = inp.get('file_id', '').strip()
     if not file_id:
         return "Не передан file_id."
-    data = _platrum_post('/tasks/api/task/update', {'id': task['id'], 'file_ids': [file_id]}, api_key)
+    # Fetch current file list to build fields_old
+    full = _platrum_post('/tasks/api/task/get', {'id': task['id']}, api_key)
+    current_files = []
+    if full.get('status') == 'success':
+        current_files = full['data'].get('file_ids') or []
+    new_files = list(current_files) + [file_id]
+    data = _platrum_post('/tasks/api/task/update', {
+        'id': task['id'],
+        'fields': {'file_ids': new_files},
+        'fields_old': {'file_ids': current_files},
+        'is_edit_further': None,
+        'start_date_from_plan': None
+    }, api_key)
     if data.get('status') != 'success':
         return f"Ошибка прикрепления файла: {data.get('error_message')}"
     url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
