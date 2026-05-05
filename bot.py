@@ -454,7 +454,7 @@ def _search_wiki(inp: dict, api_key: str) -> str:
 
     if query:
         q_lower = query.lower()
-        filtered = [a for a in articles if q_lower in a.get('name', '').lower()]
+        filtered = [a for a in articles if q_lower in (a.get('title') or '').lower()]
         articles = filtered[:8] if filtered else articles[:8]
     else:
         articles = articles[:8]
@@ -465,8 +465,12 @@ def _search_wiki(inp: dict, api_key: str) -> str:
     lines = [f"📚 База знаний — найдено {len(articles)} статей:\n"]
     for a in articles:
         article_id = a.get('id', '?')
-        name = a.get('name', 'Без названия')
-        url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+        name = a.get('title') or a.get('name') or 'Без названия'
+        slug = a.get('slug', '')
+        if slug:
+            url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}-{slug}"
+        else:
+            url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}"
         lines.append(f"• {name} (ID: {article_id})\n  {url}")
 
     return '\n'.join(lines)
@@ -481,9 +485,13 @@ def _get_wiki_article(inp: dict, api_key: str) -> str:
         return f"Ошибка получения статьи: {data.get('error_message', '')}"
 
     article = data.get('data', {})
-    name = article.get('name', 'Без названия')
+    name = article.get('title') or article.get('name') or 'Без названия'
     text = article.get('text', '')
-    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+    slug = article.get('slug', '')
+    if slug:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}-{slug}"
+    else:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}"
 
     if text:
         text = re.sub(r'<[^>]+>', ' ', text)
@@ -511,7 +519,11 @@ def _create_wiki_article(inp: dict, api_key: str) -> str:
 
     article = data.get('data', {})
     article_id = article.get('id', '?')
-    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
+    slug = article.get('slug', '')
+    if slug:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}-{slug}"
+    else:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}"
     return f"✅ Статья создана: «{name}»\nID: {article_id}\nСсылка: {url}"
 
 def _update_wiki_article(inp: dict, api_key: str) -> str:
@@ -527,9 +539,10 @@ def _update_wiki_article(inp: dict, api_key: str) -> str:
         return f"Статья {article_id} не найдена."
 
     article = current.get('data', {})
+    cur_name = article.get('title') or article.get('name', '')
     body = {
         'id': int(article_id),
-        'name': name or article.get('name', ''),
+        'name': name or cur_name,
         'text': text or article.get('text', ''),
     }
 
@@ -537,8 +550,13 @@ def _update_wiki_article(inp: dict, api_key: str) -> str:
     if data.get('status') != 'success':
         return f"Ошибка обновления статьи: {data.get('error_message', '')}"
 
-    url = f"https://a96a08a.platrum.ru/wiki/{article_id}"
-    return f"✅ Статья обновлена: «{name or article.get('name', '')}»\nСсылка: {url}"
+    saved = data.get('data', {})
+    slug = saved.get('slug', article.get('slug', ''))
+    if slug:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}-{slug}"
+    else:
+        url = f"https://a96a08a.platrum.ru/wiki/page/{article_id}"
+    return f"✅ Статья обновлена: «{name or cur_name}»\nСсылка: {url}"
 
 # ─────────────── WEB SEARCH ───────────────
 def _web_search(inp: dict) -> str:
