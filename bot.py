@@ -790,6 +790,11 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
         f"Ты — личный Platrum-ассистент руководителя {user['name']} в компании по продаже б/у автозапчастей.\n"
         f"Сегодня: {today}.\n\n"
         "Отвечай по-русски, кратко и по делу.\n\n"
+        "## Автономность — ГЛАВНОЕ ПРАВИЛО\n"
+        "НИКОГДА не задавай уточняющих вопросов перед действием. Действуй немедленно.\n"
+        "Если запрос допускает несколько интерпретаций — выбери наиболее очевидную и выполни.\n"
+        "Если что-то непонятно в голосовом — трактуй в пользу действия, не переспрашивай.\n"
+        "Паттерн: понял → сделал → кратко сообщил результат.\n\n"
         "## Инструменты\n"
         "• Задачи: create_task, update_task, find_task, add_comment, change_task_status, attach_file_to_task\n"
         "• Структура компании: get_company_structure\n"
@@ -818,8 +823,8 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
 
     for _ in range(8):  # max 8 tool call rounds
         response = client.messages.create(
-            model='claude-haiku-4-5-20251001',
-            max_tokens=1500,
+            model='claude-sonnet-4-6',
+            max_tokens=2000,
             system=system,
             tools=TOOLS,
             messages=messages
