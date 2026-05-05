@@ -210,6 +210,8 @@ def _create_task(inp: dict, api_key: str) -> str:
         body['finish_date'] = inp['finish_date']
     if inp.get('is_important'):
         body['is_important'] = True
+    if inp.get('product'):
+        body['product'] = inp['product']
 
     responsible_name = inp.get('responsible', '').strip()
     responsible_note = ''
@@ -235,7 +237,7 @@ def _find_task(inp: dict, api_key: str) -> str:
         if data.get('status') == 'success':
             t = data['data']
             url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
-            status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+            status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
             return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
     query = inp.get('query', '').strip()
     if query:
@@ -247,7 +249,7 @@ def _find_task(inp: dict, api_key: str) -> str:
             if tasks:
                 t = tasks[0]
                 url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
-                status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+                status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
                 return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
             return "Задача не найдена по запросу: " + query
     return "Не удалось найти задачу — укажи название или ID."
@@ -275,9 +277,35 @@ def _change_status(inp: dict, api_key: str) -> str:
     data = _platrum_post('/tasks/api/task/update', {'id': task['id'], 'status_key': new_status}, api_key)
     if data.get('status') != 'success':
         return f"Ошибка изменения статуса: {data.get('error_message')}"
-    status_map = {'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+    status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
     url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
     return f"Статус задачи \"{task['name']}\" изменён на: {status_map.get(new_status, new_status)}\nСсылка: {url}"
+
+def _update_task(inp: dict, api_key: str) -> str:
+    task = _resolve_task_from_input(inp, api_key)
+    if not task:
+        return "Задача не найдена. Укажи название или ID."
+    body = {'id': task['id']}
+    updated = []
+    for field in ('name', 'description', 'product', 'finish_date', 'is_important'):
+        if inp.get(field) is not None:
+            body[field] = inp[field]
+            updated.append(field)
+    responsible_name = inp.get('responsible', '').strip()
+    if responsible_name:
+        uid = find_user_id(responsible_name)
+        if uid:
+            body['responsible_user_ids'] = [uid]
+            updated.append(f'исполнитель={responsible_name}')
+        else:
+            return f"⚠️ Исполнитель «{responsible_name}» не найден в системе"
+    if len(body) <= 1:
+        return "Не указаны поля для обновления."
+    data = _platrum_post('/tasks/api/task/update', body, api_key)
+    if data.get('status') != 'success':
+        return f"Ошибка обновления задачи: {data.get('error_message')}"
+    url = f"https://a96a08a.platrum.ru/tasks?taskId={task['id']}"
+    return f"Задача \"{task['name']}\" обновлена.\nИзменены поля: {', '.join(updated)}\nСсылка: {url}"
 
 def _get_company_structure(api_key: str) -> str:
     blocks_r = _platrum_post('/orgschema/api/block/list', {}, api_key)
@@ -505,9 +533,27 @@ TOOLS = [
                 "description": {"type": "string", "description": "Описание, детали, контекст задачи"},
                 "finish_date": {"type": "string", "description": "Дедлайн в формате YYYY-MM-DD"},
                 "is_important": {"type": "boolean", "description": "True если задача срочная или важная"},
+                "product": {"type": "string", "description": "Ожидаемый результат задачи (что должно получиться в итоге)"},
                 "responsible": {"type": "string", "description": "Исполнитель задачи — фамилия или часть имени сотрудника (например: Голицын, Митасов, Кулешов)"}
             },
             "required": ["name"]
+        }
+    },
+    {
+        "name": "update_task",
+        "description": "Обновить поля задачи в Platrum: название, описание, продукт (ожидаемый результат), дедлайн, исполнитель. Используй когда просят изменить что-то в существующей задаче.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_query": {"type": "string", "description": "Название задачи для поиска"},
+                "task_id": {"type": "integer", "description": "ID задачи если известен"},
+                "name": {"type": "string", "description": "Новое название задачи"},
+                "description": {"type": "string", "description": "Новое описание задачи"},
+                "product": {"type": "string", "description": "Ожидаемый результат задачи"},
+                "finish_date": {"type": "string", "description": "Новый дедлайн в формате YYYY-MM-DD"},
+                "responsible": {"type": "string", "description": "Новый исполнитель — фамилия или часть имени"},
+                "is_important": {"type": "boolean", "description": "True если задача срочная или важная"}
+            }
         }
     },
     {
@@ -634,6 +680,8 @@ def execute_tool(name: str, inp: dict, api_key: str) -> str:
     try:
         if name == 'create_task':
             return _create_task(inp, api_key)
+        elif name == 'update_task':
+            return _update_task(inp, api_key)
         elif name == 'find_task':
             return _find_task(inp, api_key)
         elif name == 'add_comment':
@@ -684,11 +732,16 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
         f"Сегодня: {today}.\n\n"
         "Отвечай по-русски, кратко и по делу.\n\n"
         "## Инструменты\n"
-        "• Задачи: create_task, find_task, add_comment, change_task_status, attach_file_to_task\n"
+        "• Задачи: create_task, update_task, find_task, add_comment, change_task_status, attach_file_to_task\n"
         "• Структура компании: get_company_structure\n"
         "• База знаний: search_wiki (поиск), get_wiki_article (читать), "
         "create_wiki_article (создать), update_wiki_article (изменить)\n"
         "• Интернет: web_search — когда нужна внешняя справочная информация\n\n"
+        "## Поля задачи\n"
+        "• Продукт (product) = ожидаемый результат задачи: что конкретно должно получиться в итоге.\n"
+        "  Когда говорят «поменяй продукт», «задай продукт», «напиши продукт» — используй update_task с полем product.\n"
+        "  При создании задачи — сразу заполняй product если известен результат.\n"
+        "• Используй update_task для изменения любых полей существующей задачи.\n\n"
         "## Правило создания задач\n"
         "Когда руководитель обсуждает рабочую ситуацию, проблему или использует тебя как поисковик — "
         "в конце ответа предложи: «Создать задачу на эту тему?»\n"
