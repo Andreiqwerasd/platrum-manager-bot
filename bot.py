@@ -964,14 +964,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        "👋 Привет! Я твой личный Platrum-ассистент.\n\n"
+    guide_path = Path(__file__).parent / "api_key_guide.jpg"
+    caption = (
+        "👋 Привет! Я Platrum-ассистент.\n\n"
+        "Что умею:\n"
+        "🎤 Голос / видеокружок / текст — создаю задачи в Platrum\n"
+        "🔍 Найти задачу, добавить комментарий, сменить статус\n"
+        "📸 Принимаю фото (прикрепляю к задаче или описываю)\n\n"
         "Для начала нужен твой Platrum API-ключ.\n\n"
-        "Как получить:\n"
-        "1. Открой Platrum → Настройки (шестерёнка) → Интеграции и API → API ключи\n"
-        "2. Нажми «+ Добавить», назови «Бот» и сохрани\n"
-        "3. Скопируй ключ и вставь его сюда",
+        "Как получить (см. скриншот):\n"
+        "1. Зайди в Platrum — в левом меню «Интеграции и API» — «API ключи»\n"
+        "2. Нажми «+ Добавить» (кнопка вверху справа)\n"
+        "3. Назови ключ (например «Бот») — сохрани\n"
+        "4. Скопируй ключ и отправь его мне в этот чат"
     )
+    if guide_path.exists():
+        await update.message.reply_photo(photo=guide_path.open("rb"), caption=caption)
+    else:
+        await update.message.reply_text(caption)
     return WAITING_KEY
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
