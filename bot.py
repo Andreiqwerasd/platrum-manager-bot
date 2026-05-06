@@ -275,28 +275,53 @@ def _create_task(inp: dict, api_key: str) -> str:
     return f"Задача создана: #{task['id']}\nНазвание: {task['name']}{responsible_note}\nСсылка: {url}"
 
 def _find_task(inp: dict, api_key: str) -> str:
+    status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
+
     task_id = inp.get('task_id')
     if task_id:
         data = _platrum_post('/tasks/api/task/get', {'id': int(task_id)}, api_key)
         if data.get('status') == 'success':
             t = data['data']
             url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
-            status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
             return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
+
     query = inp.get('query', '').strip()
-    if query:
-        data = _platrum_post('/tasks/api/task/list', {'search': query}, api_key)
+    if not query:
+        return "Не удалось найти задачу — укажи название или ID."
+
+    # Build list of search terms to try: full query + individual words (len>2)
+    words = [w for w in query.split() if len(w) > 2]
+    search_terms = [query] + words
+
+    seen_ids = set()
+    found = []
+    for term in search_terms:
+        data = _platrum_post('/tasks/api/task/list', {'search': term}, api_key)
         if data.get('status') == 'success':
             tasks = data.get('data', [])
             if isinstance(tasks, dict):
                 tasks = tasks.get('items', tasks.get('tasks', []))
-            if tasks:
-                t = tasks[0]
-                url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
-                status_map = {'new': 'Новая', 'open': 'Открыта', 'in_progress': 'В работе', 'done': 'Выполнена', 'cancelled': 'Отменена'}
-                return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
-            return "Задача не найдена по запросу: " + query
-    return "Не удалось найти задачу — укажи название или ID."
+            for t in (tasks or []):
+                if t['id'] not in seen_ids:
+                    seen_ids.add(t['id'])
+                    found.append(t)
+        if found:
+            break  # stop after first term that returns results
+
+    if not found:
+        return f"Задача не найдена по запросу: {query}"
+
+    if len(found) == 1:
+        t = found[0]
+        url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
+        return f"Задача #{t['id']}: {t['name']}\nСтатус: {status_map.get(t.get('status_key',''), t.get('status_key',''))}\nСсылка: {url}"
+
+    # Multiple results — return list so Claude can pick
+    lines = [f"Найдено {len(found)} задач по запросу «{query}»:"]
+    for t in found[:8]:
+        url = f"https://a96a08a.platrum.ru/tasks?taskId={t['id']}"
+        lines.append(f"• #{t['id']} {t['name']} — {url}")
+    return "\n".join(lines)
 
 def _add_comment(inp: dict, api_key: str) -> str:
     task = _resolve_task_from_input(inp, api_key)
@@ -860,6 +885,13 @@ def chat_with_claude(user_text: str, user: dict, history: list) -> tuple[str, li
         "в конце ответа предложи: «Создать задачу на эту тему?»\n"
         "Если соглашается — создай задачу, ответственным поставь его (или кого укажет).\n"
         "Важный контекст разговора сохраняй как комментарии через add_comment.\n\n"
+        "## Поиск задач — стратегия\n"
+        "Инструмент find_task автоматически пробует несколько вариантов поиска.\n"
+        "Если пользователь называет задачу составным словом или произносит по-русски иностранное слово — "
+        "передавай в query именно то что услышал, инструмент сам разобьёт на части.\n"
+        "Если по первому запросу ничего — вызови find_task ещё раз с другим ключевым словом из запроса пользователя.\n"
+        "Если упоминается исполнитель/ответственный — сначала ищи задачу по имени через find_task, "
+        "затем если не нашёл — получи список сотрудников через get_company_structure и ищи по нему.\n\n"
         "## База знаний\n"
         "По вопросам о регламентах, процессах и правилах компании — сначала ищи в базе знаний.\n\n"
         "## Стиль\n"
