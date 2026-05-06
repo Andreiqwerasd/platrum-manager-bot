@@ -309,6 +309,29 @@ def _find_task(inp: dict, api_key: str) -> str:
             break  # stop after first term that returns results
 
     if not found:
+        # Fallback: search by description — fetch recent tasks and filter locally
+        kw_lower = [w.lower() for w in query.split() if len(w) > 2]
+        for offset in [0, 50]:
+            data = _platrum_post('/tasks/api/task/list', {'limit': 50, 'offset': offset}, api_key)
+            if data.get('status') == 'success':
+                batch = data.get('data', [])
+                if isinstance(batch, dict):
+                    batch = batch.get('items', batch.get('tasks', []))
+                for t in (batch or []):
+                    if t['id'] in seen_ids:
+                        continue
+                    haystack = ' '.join(filter(None, [
+                        t.get('name', ''),
+                        t.get('description', '') or '',
+                        t.get('product', '') or '',
+                    ])).lower()
+                    if any(kw in haystack for kw in kw_lower):
+                        seen_ids.add(t['id'])
+                        found.append(t)
+            if found or not batch:
+                break
+
+    if not found:
         return f"Задача не найдена по запросу: {query}"
 
     if len(found) == 1:
